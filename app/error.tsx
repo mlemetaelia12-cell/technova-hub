@@ -1,0 +1,3 @@
+'use client';
+import { useEffect } from 'react';
+export default function ErrorPage({error,reset}:{error:Error & {digest?:string};reset:()=>void}){useEffect(()=>{console.error(error);},[error]);return <main className="wrap"><section className="section"><div className="panel empty-state"><div className="eyebrow">SOMETHING WENT WRONG</div><h1 className="page-title">Let’s try that again.</h1><p className="muted">The page could not be loaded. Your existing account and challenge records have not been changed by this screen.</p><button className="btn" onClick={()=>reset()}>Try again</button></div></section></main>}
