@@ -77,7 +77,34 @@ async function run(req:Request){
   await sql`UPDATE daily_challenges SET status='published' WHERE id=${challenge[0].id}`;
   await sql`UPDATE question_generation_runs SET status='published',completed_at=NOW() WHERE challenge_date=${date}::date`;
   return NextResponse.json({ok:true,date,challengeId:Number(challenge[0].id),questionCount:ids.length,qualityReview:'passed',reviewModel:process.env.GROQ_MODEL||'openai/gpt-oss-120b'},{status:201});
- }catch(error){console.error('Daily challenge generation failed:',error);await sql`UPDATE question_generation_runs SET status='failed' WHERE challenge_date=${date}::date`;return NextResponse.json({error:'Generation or independent validation failed. Unreviewed questions were not published; check Groq configuration and retry safely.'},{status:502});}
-}
+ 
+} catch (error) {
+  const errorMessage =
+    error instanceof Error ? error.message : String(error);
+
+  console.error('Daily challenge generation failed:', error);
+
+  try {
+    await sql`
+      UPDATE question_generation_runs
+      SET
+        status = 'failed',
+        error_message = ${errorMessage.slice(0, 1000)},
+        completed_at = NOW()
+      WHERE challenge_date = ${date}::date
+    `;
+  } catch (loggingError) {
+    console.error('Failed to save generation error:', loggingError);
+  }
+
+  return NextResponse.json(
+    {
+      error: 'Generation or independent validation failed.',
+      message: errorMessage,
+    },
+    { status: 502 }
+  );
+}}
+
 export async function POST(req:Request){return run(req)}
 export async function GET(req:Request){return run(req)}

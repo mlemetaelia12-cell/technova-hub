@@ -118,6 +118,8 @@ CREATE TABLE IF NOT EXISTS question_generation_runs (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   completed_at TIMESTAMPTZ
 );
+ALTER TABLE question_generation_runs
+ADD COLUMN IF NOT EXISTS error_message TEXT;
 CREATE INDEX IF NOT EXISTS learning_progress_participant_idx ON learning_progress(participant_id);
 CREATE INDEX IF NOT EXISTS learner_projects_participant_idx ON learner_projects(participant_id);
 
