@@ -44,7 +44,18 @@ async function run(req:Request){
    'You are TECHNOVA HUB assessment author. Return JSON only with exactly five accurate, original technology questions. Each question has category, difficulty, prompt, scenario, four distinct options A-D, correct_option, explanation and learning_objective. Questions must have one defensible correct answer. Prefer clear beginner-friendly scenarios. Cover different areas: programming, web development, defensive cybersecurity, AI, databases, networking and computer science. Never create dangerous cyber instructions. Do not rely on facts that change frequently.',
    `Create five varied questions for ${date}. Avoid recycled generic stems. Questions should test understanding, not trivia. Return exactly {"questions":[...]}.`
   ));
-  if(!generated.success)throw new Error('Generated questions failed structural validation');
+  if (!generated.success) {
+  const validationErrors = generated.error.issues
+    .map(issue => {
+      const field = issue.path.join('.') || 'root';
+      return `${field}: ${issue.message}`;
+    })
+    .join('; ');
+
+  throw new Error(
+    `Generated questions failed structural validation: ${validationErrors}`
+  );
+}
   const candidates=generated.data.questions;
   if(candidates.some(q=>!uniqueQuestion(q)))throw new Error('A question contains duplicate or invalid answer options');
   if(new Set(candidates.map(q=>normalise(q.category))).size<3)throw new Error('The daily set must cover at least three distinct technology categories');
