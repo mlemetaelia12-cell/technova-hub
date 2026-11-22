@@ -821,8 +821,6 @@ export async function POST(req: Request) {
 export async function GET(req: Request) {
   return run(req);
 }
-{response.status}: ${detail.slice(0, 250)}`);
-  }
 
   const payload: unknown = await response.json();
 
