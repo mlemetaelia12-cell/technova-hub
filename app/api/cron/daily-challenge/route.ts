@@ -52,6 +52,74 @@ const reviewSchema = z.object({
 
 type Candidate = z.infer<typeof questionSchema>;
 
+/**
+ * Remove expired daily challenges only when nobody has attempted them.
+ *
+ * Challenges with attempts are intentionally retained because challenge dates
+ * are used by the streak/achievement system and attempts are learner history.
+ * After removing unused challenge links, remove only old AI-generated
+ * questions that are no longer referenced by either challenge links or
+ * attempts. XP rewards and learning progress are not touched.
+ */
+async function cleanupOldDailyChallenges(today: string): Promise<{
+  deletedChallenges: number;
+  deletedQuestions: number;
+}> {
+  const todayCompact = today.replaceAll('-', '');
+
+  const deletedChallengeRows = await sql`
+    DELETE FROM daily_challenges dc
+    WHERE dc.challenge_date < ${today}::date
+      AND NOT EXISTS (
+        SELECT 1
+        FROM challenge_attempts ca
+        WHERE ca.challenge_id = dc.id
+      )
+    RETURNING dc.id
+  `;
+
+  const deletedQuestionRows = await sql`
+    DELETE FROM questions q
+    WHERE q.question_code ~ '^AI-[0-9]{8}-[1-9][0-9]*$'
+      AND substring(q.question_code FROM 4 FOR 8) < ${todayCompact}
+      AND NOT EXISTS (
+        SELECT 1
+        FROM daily_challenge_questions dcq
+        WHERE dcq.question_id = q.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM challenge_attempts ca
+        WHERE ca.question_id = q.id
+      )
+    RETURNING q.id
+  `;
+
+  return {
+    deletedChallenges: deletedChallengeRows.length,
+    deletedQuestions: deletedQuestionRows.length,
+  };
+}
+
+/**
+ * Cleanup must never turn a successfully published challenge into a failed
+ * generation response. Log cleanup errors and allow publishing to succeed.
+ */
+async function runOldChallengeCleanup(today: string) {
+  try {
+    const result = await cleanupOldDailyChallenges(today);
+    console.info('Old daily challenge cleanup completed:', result);
+    return result;
+  } catch (error) {
+    console.error('Old daily challenge cleanup failed:', error);
+    return {
+      deletedChallenges: 0,
+      deletedQuestions: 0,
+      cleanupError: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 function normalise(value: string): string {
   return value
     .toLowerCase()
@@ -345,10 +413,13 @@ async function run(req: Request) {
     `;
 
     if (prior[0]?.status === 'published') {
+      const cleanup = await runOldChallengeCleanup(date);
+
       return NextResponse.json({
         ok: true,
         date,
         message: 'Challenge already published',
+        cleanup,
       });
     }
 
@@ -368,10 +439,13 @@ async function run(req: Request) {
         WHERE challenge_date = ${date}::date
       `;
 
+      const cleanup = await runOldChallengeCleanup(date);
+
       return NextResponse.json({
         ok: true,
         date,
         message: 'Recovered and published the prepared challenge',
+        cleanup,
       });
     }
 
@@ -686,6 +760,8 @@ Do not add Markdown or text outside the JSON object.`,
       WHERE challenge_date = ${date}::date
     `;
 
+    const cleanup = await runOldChallengeCleanup(date);
+
     return NextResponse.json(
       {
         ok: true,
@@ -694,6 +770,7 @@ Do not add Markdown or text outside the JSON object.`,
         questionCount: ids.length,
         qualityReview: 'passed',
         reviewModel: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
+        cleanup,
       },
       { status: 201 }
     );
