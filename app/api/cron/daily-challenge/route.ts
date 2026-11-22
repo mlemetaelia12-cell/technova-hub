@@ -40,10 +40,79 @@ async function run(req:Request){
   if(!lock.length)return NextResponse.json({ok:true,date,message:'Generation is already running or complete'});
   await sql`DELETE FROM questions WHERE question_code LIKE ${'AI-'+date.replaceAll('-','')+'-%'} AND NOT EXISTS(SELECT 1 FROM daily_challenge_questions WHERE daily_challenge_questions.question_id=questions.id)`;
 
-  const generated=payloadSchema.safeParse(await groqJson(
-   'You are TECHNOVA HUB assessment author. Return JSON only with exactly five accurate, original technology questions. Each question has category, difficulty, prompt, scenario, four distinct options A-D, correct_option, explanation and learning_objective. Questions must have one defensible correct answer. Prefer clear beginner-friendly scenarios. Cover different areas: programming, web development, defensive cybersecurity, AI, databases, networking and computer science. Never create dangerous cyber instructions. Do not rely on facts that change frequently.',
-   `Create five varied questions for ${date}. Avoid recycled generic stems. Questions should test understanding, not trivia. Return exactly {"questions":[...]}.`
-  ));
+  
+const generated = payloadSchema.safeParse(await groqJson(
+  `You are TECHNOVA HUB's professional technology assessment author.
+
+STRICT OUTPUT REQUIREMENTS:
+Return valid JSON only.
+Generate exactly five questions inside the "questions" array.
+
+Every question MUST follow these exact rules:
+
+1. "category": a technology category string.
+2. "difficulty": MUST be exactly one of these lowercase strings:
+   "easy", "medium", "hard".
+   Never use "beginner", "intermediate", "advanced", or other values.
+3. "prompt": a clear question between 35 and 600 characters.
+4. "scenario": either a string or null, maximum 700 characters.
+5. "options": MUST be a JSON ARRAY containing exactly four objects.
+   Each object MUST have:
+   - "id": exactly "A", "B", "C", or "D".
+   - "text": a string between 3 and 300 characters.
+
+   IMPORTANT: Never return options as an object keyed by A, B, C, D.
+   Never return options as strings or a nested object.
+
+6. "correct_option": exactly "A", "B", "C", or "D".
+7. "explanation": a clear explanation between 40 and 800 characters.
+8. "learning_objective": between 8 and 240 characters.
+
+EXACT REQUIRED JSON STRUCTURE:
+
+{
+  "questions": [
+    {
+      "category": "Web Development",
+      "difficulty": "easy",
+      "prompt": "A question with at least 35 characters...",
+      "scenario": null,
+      "options": [
+        {"id": "A", "text": "First possible answer"},
+        {"id": "B", "text": "Second possible answer"},
+        {"id": "C", "text": "Third possible answer"},
+        {"id": "D", "text": "Fourth possible answer"}
+      ],
+      "correct_option": "B",
+      "explanation": "An explanation of at least 40 characters...",
+      "learning_objective": "Understand web development fundamentals"
+    }
+  ]
+}
+
+The example illustrates the structure only. Generate five complete original questions.
+
+QUALITY REQUIREMENTS:
+- Every question must have exactly one defensible correct answer.
+- All four options must be distinct and plausible.
+- Cover at least three different technology categories.
+- Avoid repeated questions and generic recycled question stems.
+- Test practical understanding rather than trivia.
+- Prefer clear beginner-friendly scenarios.
+- Cover programming, web development, defensive cybersecurity, AI, databases, networking and computer science.
+- Never provide dangerous cyber instructions.
+- Do not rely on facts that change frequently.
+
+Before returning JSON, verify every field against these requirements.
+Do not include Markdown, explanations outside JSON, or additional properties.`,
+
+  `Create five varied technology assessment questions for ${date}.
+
+Avoid recycled generic stems. Test understanding through practical situations.
+
+Return exactly one JSON object with a "questions" array containing exactly five questions. Follow the required field names, types, values and structure exactly.`
+));
+
   if (!generated.success) {
   const validationErrors = generated.error.issues
     .map(issue => {
