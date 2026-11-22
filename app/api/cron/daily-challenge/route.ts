@@ -1,3 +1,4 @@
+
 import { NextResponse } from 'next/server';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
@@ -6,7 +7,9 @@ import { tanzaniaDate } from '@/lib/dates';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-export const maxDuration = 60;
+export const maxDuration = 210;
+
+const MAX_GENERATION_ATTEMPTS = 3;
 
 const optionSchema = z.object({
   id: z.enum(['A', 'B', 'C', 'D']),
@@ -277,8 +280,6 @@ function normaliseOptions(value: unknown): unknown {
     const record = value as Record<string, unknown>;
     const ids = ['A', 'B', 'C', 'D'] as const;
 
-    // Handles { A: "...", B: "...", C: "...", D: "..." } and
-    // { A: { text: "..." }, ... }.
     if (ids.some((id) => Object.prototype.hasOwnProperty.call(record, id))) {
       return ids
         .filter((id) => Object.prototype.hasOwnProperty.call(record, id))
@@ -288,7 +289,6 @@ function normaliseOptions(value: unknown): unknown {
         }));
     }
 
-    // Handles { options: [...] } if the model adds one extra wrapper.
     if (Array.isArray(record.options)) {
       return normaliseOptions(record.options);
     }
@@ -346,6 +346,506 @@ async function groqJson(system: string, user: string): Promise<unknown> {
         ],
       }),
       signal: AbortSignal.timeout(25000),
+    }
+  );
+
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`Groq returned ${response.status}: ${detail.slice(0, 250)}`);
+  }
+
+  const payload: unknown = await response.json();
+
+  const choices =
+    payload &&
+    typeof payload === 'object' &&
+    'choices' in payload &&
+    Array.isArray(payload.choices)
+      ? payload.choices
+      : [];
+
+  const first = choices[0];
+  const message =
+    first && typeof first === 'object' && 'message' in first
+      ? first.message
+      : null;
+  const content =
+    message && typeof message === 'object' && 'content' in message
+      ? message.content
+      : null;
+
+  if (typeof content !== 'string') {
+    throw new Error('Groq returned no JSON content');
+  }
+
+  try {
+    return JSON.parse(content) as unknown;
+  } catch {
+    throw new Error('Groq returned content that was not valid JSON');
+  }
+}
+
+async function run(req: Request) {
+  const secret = process.env.CRON_SECRET;
+
+  if (
+    !secret ||
+    req.headers.get('authorization') !== `Bearer ${secret}`
+  ) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const date = tanzaniaDate();
+
+  try {
+    const prior = await sql`
+      SELECT
+        id,
+        status,
+        (
+          SELECT COUNT(*)::int
+          FROM daily_challenge_questions
+          WHERE challenge_id = daily_challenges.id
+        ) AS question_count
+      FROM daily_challenges
+      WHERE challenge_date = ${date}::date
+      LIMIT 1
+    `;
+
+    if (prior[0]?.status === 'published') {
+      const cleanup = await runOldChallengeCleanup(date);
+
+      return NextResponse.json({
+        ok: true,
+        date,
+        message: 'Challenge already published',
+        cleanup,
+      });
+    }
+
+    if (
+      prior[0]?.status === 'scheduled' &&
+      Number(prior[0].question_count) === 5
+    ) {
+      await sql`
+        UPDATE daily_challenges
+        SET status = 'published'
+        WHERE id = ${prior[0].id}
+      `;
+
+      await sql`
+        UPDATE question_generation_runs
+        SET status = 'published', completed_at = NOW()
+        WHERE challenge_date = ${date}::date
+      `;
+
+      const cleanup = await runOldChallengeCleanup(date);
+
+      return NextResponse.json({
+        ok: true,
+        date,
+        message: 'Recovered and published the prepared challenge',
+        cleanup,
+      });
+    }
+
+    if (prior.length) {
+      await sql`
+        DELETE FROM daily_challenges
+        WHERE id = ${prior[0].id}
+      `;
+    }
+
+    const lock = await sql`
+      INSERT INTO question_generation_runs (challenge_date, status)
+      VALUES (${date}::date, 'started')
+      ON CONFLICT (challenge_date)
+      DO UPDATE SET
+        status = 'started',
+        created_at = NOW(),
+        completed_at = NULL,
+        error_message = NULL
+      WHERE
+        question_generation_runs.status = 'failed'
+        OR question_generation_runs.created_at < NOW() - INTERVAL '20 minutes'
+      RETURNING id
+    `;
+
+    if (!lock.length) {
+      return NextResponse.json({
+        ok: true,
+        date,
+        message: 'Generation is already running or complete',
+      });
+    }
+
+    await sql`
+      DELETE FROM questions
+      WHERE question_code LIKE ${`AI-${date.replaceAll('-', '')}-%`}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM daily_challenge_questions
+          WHERE daily_challenge_questions.question_id = questions.id
+        )
+    `;
+
+    let approvedCandidates: Candidate[] | null = null;
+    let attemptsUsed = 0;
+    let rejectionFeedback = '';
+
+    for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt += 1) {
+      try {
+        const rawGenerated = await groqJson(
+          `You are TECHNOVA HUB's professional technology assessment author.
+
+Return valid JSON only. Generate exactly five original technology questions in a "questions" array.
+
+Every question must contain:
+- category: string, 2-40 characters.
+- difficulty: exactly "easy", "medium", or "hard" (lowercase string only).
+- prompt: string, 35-600 characters.
+- scenario: string or null, maximum 700 characters.
+- options: an ARRAY of exactly four objects, never an object.
+  Each option must contain "id" (A, B, C, or D) and "text" (3-300 characters).
+- correct_option: exactly "A", "B", "C", or "D".
+- explanation: string, 40-800 characters.
+- learning_objective: string, 8-240 characters.
+
+Use this exact structure:
+{
+  "questions": [
+    {
+      "category": "Web Development",
+      "difficulty": "easy",
+      "prompt": "A complete question with enough detail to be meaningful?",
+      "scenario": null,
+      "options": [
+        { "id": "A", "text": "First possible answer" },
+        { "id": "B", "text": "Second possible answer" },
+        { "id": "C", "text": "Third possible answer" },
+        { "id": "D", "text": "Fourth possible answer" }
+      ],
+      "correct_option": "B",
+      "explanation": "A clear explanation that supports the correct answer.",
+      "learning_objective": "Understand web development fundamentals"
+    }
+  ]
+}
+
+The example shows the format; return five complete questions, not one.
+Do not use "beginner", "intermediate", or "advanced" for difficulty.
+Do not return options as an object keyed by A-D.
+Use at least three distinct technology categories.
+Make all options distinct and plausible, with exactly one defensible correct answer.
+Prefer practical beginner-friendly scenarios.
+Cover programming, web development, defensive cybersecurity, AI, databases, networking, and computer science across the set.
+Do not provide dangerous cyber instructions or rely on frequently changing facts.
+Do not add Markdown or text outside the JSON object.`,
+          `Create five varied technology assessment questions for ${date}. Avoid recycled generic stems. Test practical understanding rather than trivia. Return exactly one JSON object with a "questions" array of five complete questions. This is generation attempt ${attempt} of ${MAX_GENERATION_ATTEMPTS}. ${rejectionFeedback ? `Previous attempt feedback: ${rejectionFeedback}. Avoid the rejected topic, concept, scenario, wording, and learning objective; create genuinely different questions.` : "Create a fresh, diverse set."}`
+        );
+
+        // Normalize common model formatting variations, then validate strictly.
+        const normalizedGenerated = normaliseGeneratedPayload(rawGenerated);
+        const generated = payloadSchema.safeParse(normalizedGenerated);
+
+        if (!generated.success) {
+          const validationErrors = generated.error.issues
+            .map((issue) => {
+              const path = issue.path.join('.') || 'root';
+              return `${path}: ${issue.message}`;
+            })
+            .join('; ');
+
+          throw new Error(
+            `Generated questions failed structural validation: ${validationErrors}`
+          );
+        }
+
+        const candidates = generated.data.questions;
+
+        if (candidates.some((candidate) => !uniqueQuestion(candidate))) {
+          throw new Error(
+            'A question contains duplicate or invalid answer options'
+          );
+        }
+
+        if (
+          new Set(candidates.map((candidate) => normalise(candidate.category)))
+            .size < 3
+        ) {
+          throw new Error(
+            'The daily set must cover at least three distinct technology categories'
+          );
+        }
+
+        const history = await sql`
+          SELECT prompt, scenario, options
+          FROM questions
+          WHERE created_at > NOW() - INTERVAL '365 days'
+          ORDER BY created_at DESC
+          LIMIT 600
+        `;
+
+        const historyText = history.map((row, index) => ({
+          id: index + 1,
+          prompt: String(row.prompt),
+          scenario: String(row.scenario ?? ''),
+          options: Array.isArray(row.options) ? row.options : [],
+        }));
+
+        const accepted: string[] = [];
+
+        for (const candidate of candidates) {
+          const combined = [
+            candidate.prompt,
+            candidate.scenario ?? '',
+            ...candidate.options.map((item) => item.text),
+          ].join(' ');
+
+          if (
+            accepted.some((previous) => overlap(previous, combined) >= 0.4)
+          ) {
+            throw new Error('Generated questions are too similar to one another');
+          }
+
+          if (
+            history.some((old) =>
+              overlap(
+                combined,
+                [
+                  String(old.prompt),
+                  String(old.scenario ?? ''),
+                  JSON.stringify(old.options),
+                ].join(' ')
+              ) >= 0.48
+            )
+          ) {
+            throw new Error(
+              'Generated question is too similar to the question history'
+            );
+          }
+
+          accepted.push(combined);
+        }
+
+        const review = reviewSchema.safeParse(
+          await groqJson(
+            'You are an independent, strict assessment quality reviewer. You did not write these questions. Review each numbered candidate against the supplied history. Check factual correctness, whether the marked answer is unambiguously the best answer, whether the explanation supports that answer, whether distractors create ambiguity, and whether it is a duplicate or close paraphrase of a historical question or another candidate. Do not repair or rewrite. Be conservative: reject uncertain, ambiguous, unsupported, or duplicate questions. Return JSON only: {"reviews":[{"id":1,"approved":true,"factually_supported":true,"unambiguous":true,"correct_answer_valid":true,"duplicate":false,"feedback":"..."}]}. Include exactly one review for each id 1..5.',
+            JSON.stringify({
+              candidates: candidates.map((candidate, index) => ({
+                id: index + 1,
+                ...candidate,
+              })),
+              recentQuestionHistory: historyText.slice(0, 160),
+            })
+          )
+        );
+
+        if (!review.success) {
+          const reviewErrors = review.error.issues
+            .map((issue) => `${issue.path.join('.')}: ${issue.message}`)
+            .join('; ');
+          throw new Error(
+            `Independent question review response was invalid: ${reviewErrors}`
+          );
+        }
+
+        const verdicts = [...review.data.reviews].sort(
+          (a, b) => a.id - b.id
+        );
+
+        if (verdicts.map((verdict) => verdict.id).join(',') !== '1,2,3,4,5') {
+          throw new Error(
+            'Independent reviewer did not return exactly one verdict for each question'
+          );
+        }
+
+        const rejected = verdicts.filter(
+          (verdict) =>
+            !verdict.approved ||
+            !verdict.factually_supported ||
+            !verdict.unambiguous ||
+            !verdict.correct_answer_valid ||
+            verdict.duplicate
+        );
+
+        if (rejected.length) {
+          throw new Error(
+            'Independent reviewer rejected one or more questions: ' +
+              rejected
+                .map((verdict) => `Q${verdict.id}: ${verdict.feedback}`)
+                .join(' | ')
+          );
+        }
+
+        approvedCandidates = candidates;
+        attemptsUsed = attempt;
+        break;
+      } catch (error) {
+        rejectionFeedback =
+          error instanceof Error ? error.message : String(error);
+
+        console.warn('Daily challenge generation attempt failed', {
+          date,
+          attempt,
+          maxAttempts: MAX_GENERATION_ATTEMPTS,
+          reason: rejectionFeedback,
+        });
+
+        if (attempt === MAX_GENERATION_ATTEMPTS) {
+          throw new Error(
+            `Daily challenge generation failed after ${MAX_GENERATION_ATTEMPTS} attempts. Last error: ${rejectionFeedback}`
+          );
+        }
+      }
+    }
+
+    if (!approvedCandidates) {
+      throw new Error(
+        'Daily challenge generation did not produce an approved question set'
+      );
+    }
+
+    const ids: number[] = [];
+
+    for (let index = 0; index < approvedCandidates.length; index += 1) {
+      const candidate = approvedCandidates[index];
+      const code = `AI-${date.replaceAll('-', '')}-${index + 1}`;
+      const hash = fingerprint(candidate);
+
+      const row = await sql`
+        INSERT INTO questions (
+          question_code,
+          category,
+          difficulty,
+          question_type,
+          prompt,
+          scenario,
+          options,
+          correct_option,
+          explanation,
+          learning_objective,
+          source_name,
+          status,
+          content_fingerprint,
+          quality_reviewed_at,
+          quality_review_model
+        )
+        VALUES (
+          ${code},
+          ${candidate.category},
+          ${candidate.difficulty},
+          'scenario',
+          ${candidate.prompt},
+          ${candidate.scenario},
+          ${JSON.stringify(candidate.options)},
+          ${candidate.correct_option},
+          ${candidate.explanation},
+          ${candidate.learning_objective},
+          'Groq AI - independently reviewed',
+          'approved',
+          ${hash},
+          NOW(),
+          ${process.env.GROQ_MODEL || 'openai/gpt-oss-120b'}
+        )
+        ON CONFLICT DO NOTHING
+        RETURNING id
+      `;
+
+      if (!row.length) {
+        throw new Error(
+          'A generated question matched a previously stored fingerprint'
+        );
+      }
+
+      ids.push(Number(row[0].id));
+    }
+
+    const challenge = await sql`
+      INSERT INTO daily_challenges (challenge_date, status)
+      VALUES (${date}::date, 'scheduled')
+      RETURNING id
+    `;
+
+    for (let index = 0; index < ids.length; index += 1) {
+      await sql`
+        INSERT INTO daily_challenge_questions (
+          challenge_id,
+          question_id,
+          position,
+          points
+        )
+        VALUES (${challenge[0].id}, ${ids[index]}, ${index + 1}, 2)
+      `;
+    }
+
+    await sql`
+      UPDATE daily_challenges
+      SET status = 'published'
+      WHERE id = ${challenge[0].id}
+    `;
+
+    await sql`
+      UPDATE question_generation_runs
+      SET
+        status = 'published',
+        error_message = NULL,
+        completed_at = NOW()
+      WHERE challenge_date = ${date}::date
+    `;
+
+    const cleanup = await runOldChallengeCleanup(date);
+
+    return NextResponse.json(
+      {
+        ok: true,
+        date,
+        challengeId: Number(challenge[0].id),
+        questionCount: ids.length,
+        qualityReview: 'passed',
+        attemptsUsed,
+        reviewModel: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
+        cleanup,
+      },
+      { status: 201 }
+    );
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.message : String(error);
+
+    console.error('Daily challenge generation failed:', error);
+
+    try {
+      await sql`
+        UPDATE question_generation_runs
+        SET
+          status = 'failed',
+          error_message = ${errorMessage.slice(0, 1000)},
+          completed_at = NOW()
+        WHERE challenge_date = ${date}::date
+      `;
+    } catch (loggingError) {
+      console.error('Failed to save generation error:', loggingError);
+    }
+
+    return NextResponse.json(
+      {
+        error: 'Generation or independent validation failed.',
+        message: errorMessage,
+      },
+      { status: 502 }
+    );
+  }
+}
+
+export async function POST(req: Request) {
+  return run(req);
+}
+
+export async function GET(req: Request) {
+  return run(req);
+}
+al.timeout(25000),
     }
   );
 
