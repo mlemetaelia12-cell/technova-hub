@@ -9,6 +9,10 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 90;
 
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const idsSchema = z.object({
   ids: z.array(z.coerce.number().int().positive()).length(5),
 });
@@ -193,7 +197,7 @@ export async function POST(req: Request) {
       FROM questions
       WHERE NOT (id = ANY(${ids}))
       ORDER BY created_at DESC
-      LIMIT 160
+      LIMIT 50
     `;
 
     const historyForReview = history.map((row) => ({
@@ -213,7 +217,10 @@ export async function POST(req: Request) {
     const model =
       process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 
-    const reviewerResponse = await fetch(
+    let reviewerResponse: Response | null = null;
+
+    for (let retry = 0; retry < 3; retry += 1) {
+      reviewerResponse = await fetch(
       'https://api.groq.com/openai/v1/chat/completions',
       {
         method: 'POST',
@@ -224,7 +231,7 @@ export async function POST(req: Request) {
         body: JSON.stringify({
           model,
           temperature: 0.1,
-          max_tokens: 4000,
+          max_tokens: 1200,
           response_format: { type: 'json_object' },
           messages: [
             {
@@ -288,15 +295,31 @@ Never replace the original database IDs with numbering such as 1, 2, 3, 4, 5.
             },
           ],
         }),
-        signal: AbortSignal.timeout(25000),
+        signal: AbortSignal.timeout(30000),
       }
-    );
+      );
 
-    if (!reviewerResponse.ok) {
-      const detail = await reviewerResponse.text();
+      if (reviewerResponse.ok || reviewerResponse.status !== 429 || retry === 2) {
+        break;
+      }
 
+      const retryAfter = Number(reviewerResponse.headers.get('retry-after'));
+      const delayMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1000, 45000)
+        : (retry + 1) * 20000;
+
+      console.warn('Groq reviewer rate limit reached; waiting before retry', {
+        retry: retry + 1,
+        delayMs,
+      });
+      await wait(delayMs);
+    }
+
+    if (!reviewerResponse?.ok) {
+      const status = reviewerResponse?.status ?? 0;
+      const detail = reviewerResponse ? await reviewerResponse.text() : 'No response from Groq';
       throw new Error(
-        `Groq reviewer error ${reviewerResponse.status}: ${detail.slice(0, 250)}`
+        `Groq reviewer error ${status}: ${detail.slice(0, 250)}`
       );
     }
 
