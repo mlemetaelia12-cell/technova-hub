@@ -10,6 +10,11 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 210;
 
 const MAX_GENERATION_ATTEMPTS = 3;
+const GROQ_MAX_RETRIES = 2;
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 const optionSchema = z.object({
   id: z.enum(['A', 'B', 'C', 'D']),
@@ -304,31 +309,51 @@ async function groqJson(system: string, user: string): Promise<unknown> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error('GROQ_API_KEY is missing');
 
-  const response = await fetch(
-    'https://api.groq.com/openai/v1/chat/completions',
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
-        temperature: 0.1,
-        max_tokens: 4000,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-      }),
-      signal: AbortSignal.timeout(25000),
-    }
-  );
+  let response: Response | null = null;
 
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`Groq returned ${response.status}: ${detail.slice(0, 250)}`);
+  for (let retry = 0; retry <= GROQ_MAX_RETRIES; retry += 1) {
+    response = await fetch(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
+          temperature: 0.1,
+          max_tokens: system.includes('independent, strict assessment quality reviewer') ? 1200 : 2400,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: user },
+          ],
+        }),
+        signal: AbortSignal.timeout(30000),
+      }
+    );
+
+    if (response.ok || response.status !== 429 || retry === GROQ_MAX_RETRIES) {
+      break;
+    }
+
+    const retryAfter = Number(response.headers.get('retry-after'));
+    const delayMs = Number.isFinite(retryAfter) && retryAfter > 0
+      ? Math.min(retryAfter * 1000, 45000)
+      : (retry + 1) * 20000;
+
+    console.warn('Groq rate limit reached; waiting before retry', {
+      retry: retry + 1,
+      delayMs,
+    });
+    await wait(delayMs);
+  }
+
+  if (!response?.ok) {
+    const status = response?.status ?? 0;
+    const detail = response ? await response.text() : 'No response from Groq';
+    throw new Error(`Groq returned ${status}: ${detail.slice(0, 250)}`);
   }
 
   const payload: unknown = await response.json();
@@ -559,7 +584,7 @@ Do not add Markdown or text outside the JSON object.`,
           FROM questions
           WHERE created_at > NOW() - INTERVAL '365 days'
           ORDER BY created_at DESC
-          LIMIT 600
+          LIMIT 100
         `;
 
         const historyText = history.map((row, index) => ({
@@ -612,7 +637,7 @@ Do not add Markdown or text outside the JSON object.`,
                 id: index + 1,
                 ...candidate,
               })),
-              recentQuestionHistory: historyText.slice(0, 160),
+              recentQuestionHistory: historyText.slice(0, 50),
             })
           )
         );
